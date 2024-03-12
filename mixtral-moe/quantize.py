@@ -98,6 +98,18 @@ class WeightOnlyBit8QuantHandler:
         return self.mod
 
 
+def linear_forward_int8(x, weight_int8pack, scales, out_features):
+    if x.is_cuda:
+        return F.linear(x, weight_int8pack.to(dtype=x.dtype)) * scales
+
+    origin_x_size = x.size()
+    x = x.reshape(-1, origin_x_size[-1])
+    c = torch.ops.aten._weight_int8pack_mm(x, weight_int8pack, scales)
+    new_shape = origin_x_size[:-1] + (out_features,)
+    c = c.reshape(new_shape)
+    return c
+
+
 class WeightOnlyBit8Linear(torch.nn.Module):
     __constants__ = ['in_features', 'out_features']
     in_features: int
@@ -115,7 +127,9 @@ class WeightOnlyBit8Linear(torch.nn.Module):
         self.register_buffer("scales", torch.ones(out_features, dtype=torch.bfloat16))
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return F.linear(input, self.weight.to(dtype=input.dtype)) * self.scales
+        return linear_forward_int8(
+            input,
+            self.weight, self.scales, self.out_features)
 
 
 class ConditionalFeedForwardBit8(nn.Module):
