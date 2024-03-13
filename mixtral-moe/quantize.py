@@ -156,9 +156,264 @@ class ConditionalFeedForwardBit8(nn.Module):
         return expert_outs
 
 
+def get_group_qparams(w, n_bit=4, groupsize=32):
+    # needed for GPTQ with padding
+    if groupsize > w.shape[-1]:
+        groupsize = w.shape[-1]
+    assert groupsize > 1
+    assert w.shape[-1] % groupsize == 0
+    assert w.dim() == 2
+
+    to_quant = w.reshape(-1, groupsize)
+    assert torch.isnan(to_quant).sum() == 0
+
+    max_val = to_quant.amax(dim=1, keepdim=True)
+    min_val = to_quant.amin(dim=1, keepdim=True)
+    max_int = 2**n_bit - 1
+    scales = (max_val - min_val).clamp(min=1e-6) / max_int
+    zeros = min_val + scales * (2 ** (n_bit - 1))
+    return scales.to(torch.bfloat16).reshape(w.shape[0], -1), zeros.to(
+        torch.bfloat16
+    ).reshape(w.shape[0], -1)
+
+
+def pack_scales_and_zeros(scales, zeros):
+    assert scales.shape == zeros.shape
+    assert scales.dtype == torch.bfloat16
+    assert zeros.dtype == torch.bfloat16
+    return (
+        torch.cat(
+            [
+                scales.reshape(scales.size(0), scales.size(1), 1),
+                zeros.reshape(zeros.size(0), zeros.size(1), 1),
+            ],
+            2,
+        )
+        .transpose(0, 1)
+        .contiguous()
+    )
+
+
+def unpack_scales_and_zeros(scales_and_zeros):
+    assert len(scales_and_zeros.shape) == 3 and scales_and_zeros.shape[2] == 2
+    assert scales_and_zeros.dtype == torch.float
+    return torch.split(scales_and_zeros.transpose(0, 1), 1, 2)
+
+
+def group_quantize_tensor_from_qparams(w, scales, zeros, n_bit=4, groupsize=32):
+    assert groupsize > 1
+    # needed for GPTQ single column quantize
+    if groupsize > w.shape[-1] and scales.shape[-1] == 1:
+        groupsize = w.shape[-1]
+
+    assert w.shape[-1] % groupsize == 0
+    assert w.dim() == 2
+
+    to_quant = w.reshape(-1, groupsize)
+    assert torch.isnan(to_quant).sum() == 0
+
+    scales = scales.reshape(-1, 1)
+    zeros = zeros.reshape(-1, 1)
+    min_val = zeros - scales * (2 ** (n_bit - 1))
+    max_int = 2**n_bit - 1
+    min_int = 0
+    w_int32 = (
+        to_quant.sub(min_val)
+        .div(scales)
+        .round()
+        .clamp_(min_int, max_int)
+        .to(torch.int32)
+        .reshape_as(w)
+    )
+
+    return w_int32
+
+
+def group_quantize_tensor(w, n_bit=4, groupsize=32):
+    scales, zeros = get_group_qparams(w, n_bit, groupsize)
+    w_int32 = group_quantize_tensor_from_qparams(w, scales, zeros, n_bit, groupsize)
+    scales_and_zeros = pack_scales_and_zeros(scales, zeros)
+    return w_int32, scales_and_zeros
+
+
+def group_dequantize_tensor_from_qparams(
+    w_int32, scales, zeros, n_bit=4, groupsize=32
+):
+    assert groupsize > 1
+    # needed for GPTQ single column dequantize
+    if groupsize > w_int32.shape[-1] and scales.shape[-1] == 1:
+        groupsize = w_int32.shape[-1]
+    assert w_int32.shape[-1] % groupsize == 0
+    assert w_int32.dim() == 2
+
+    w_int32_grouped = w_int32.reshape(-1, groupsize)
+    scales = scales.reshape(-1, 1)
+    zeros = zeros.reshape(-1, 1)
+
+    w_dq = (
+        w_int32_grouped.sub(2 ** (n_bit - 1)).mul(scales).add(zeros).reshape_as(w_int32)
+    )
+    return w_dq
+
+
+def group_dequantize_tensor(w_int32, scales_and_zeros, n_bit=4, groupsize=32):
+    scales, zeros = unpack_scales_and_zeros(scales_and_zeros)
+    return group_dequantize_tensor_from_qparams(
+        w_int32, scales, zeros, n_bit, groupsize
+    )
+
+
+##### weight only int4 per channel groupwise quantized code ######
+
+def prepare_int4_weight_and_scales_and_zeros(weight_bf16, groupsize, inner_k_tiles):
+    weight_int32, scales_and_zeros = group_quantize_tensor(
+        weight_bf16, n_bit=4, groupsize=groupsize
+    )
+    print(weight_bf16.shape)
+    print(weight_int32.shape)
+    weight_int4pack = torch.ops.aten._convert_weight_to_int4pack(weight_int32, inner_k_tiles)
+    # import pdb
+    # pdb.set_trace()
+    return weight_int4pack, scales_and_zeros
+
+
+def linear_forward_int4(x, weight_int4pack, scales_and_zeros, out_features, groupsize):
+    origin_x_size = x.size()
+    x = x.reshape(-1, origin_x_size[-1])
+    c = torch.ops.aten._weight_int4pack_mm(x, weight_int4pack, groupsize, scales_and_zeros)
+    new_shape = origin_x_size[:-1] + (out_features,)
+    c = c.reshape(new_shape)
+    return c
+
+
+def _check_linear_int4_k(k, groupsize = 1, inner_k_tiles = 1):
+    return k % groupsize == 0 and k % (inner_k_tiles * 16) == 0
+
+def replace_linear_int4(module, groupsize, inner_k_tiles, padding, use_cuda):
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear) and child.out_features != 8:
+            if _check_linear_int4_k(child.in_features, groupsize, inner_k_tiles):
+                setattr(module, name, WeightOnlyInt4Linear(
+                    child.in_features, child.out_features, bias=False,
+                    groupsize=groupsize, inner_k_tiles=inner_k_tiles, padding=False, use_cuda=use_cuda
+                ))
+            elif padding:
+                setattr(module, name, WeightOnlyInt4Linear(
+                    child.in_features, child.out_features, bias=False,
+                    groupsize=groupsize, inner_k_tiles=inner_k_tiles, padding=True, use_cuda=use_cuda
+                ))
+        else:
+            replace_linear_int4(child, groupsize, inner_k_tiles, padding, use_cuda)
+
+
+class WeightOnlyInt4QuantHandler:
+    def __init__(self, mod, groupsize=32, inner_k_tiles=8, padding=True):
+        self.mod = mod
+        self.groupsize = groupsize
+        self.inner_k_tiles = inner_k_tiles
+        self.padding = padding
+        assert groupsize in [32, 64, 128, 256]
+        assert inner_k_tiles in [2, 4, 8]
+
+    @torch.no_grad()
+    def create_quantized_state_dict(self):
+        cur_state_dict = self.mod.state_dict()
+        for fqn, mod in self.mod.named_modules():
+            if isinstance(mod, torch.nn.Linear) and mod.out_features != 8:
+                # import pdb
+                # pdb.set_trace()
+                assert not mod.bias
+                out_features = mod.out_features
+                in_features = mod.in_features
+                assert out_features % 8 == 0, "require out_features % 8 == 0"
+                print(f"linear: {fqn}, in={in_features}, out={out_features}")
+
+                weight = mod.weight.data
+                print("weight ", weight.shape)
+                print(_check_linear_int4_k(in_features, self.groupsize, self.inner_k_tiles))
+                if not _check_linear_int4_k(in_features, self.groupsize, self.inner_k_tiles):
+                    if self.padding:
+                        from model import find_multiple
+                        import torch.nn.functional as F
+                        print(f"warning: {fqn} is padded to satisfy in_features % 1024 == 0")
+                        padded_in_features = find_multiple(in_features, 1024)
+                        weight = F.pad(weight, pad=(0, padded_in_features - in_features))
+                    else:
+                        print(f"warning: {fqn} is skipped, int4 requires that in_features is 32, 64, or is divisible by 1024, " +
+                            "and that groupsize and inner_k_tiles*16 evenly divide into it")
+                        continue
+                weight_int4pack, scales_and_zeros = prepare_int4_weight_and_scales_and_zeros(
+                    weight.to(torch.bfloat16), self.groupsize, self.inner_k_tiles
+                )
+                # import pdb
+                # pdb.set_trace()
+                cur_state_dict[f"{fqn}.weight"] = weight_int4pack.to('cpu')
+                print(fqn, weight_int4pack.shape)
+                cur_state_dict[f"{fqn}.scales_and_zeros"] = scales_and_zeros.to('cpu')
+
+        return cur_state_dict
+
+    def convert_for_runtime(self, use_cuda):
+        replace_linear_int4(self.mod, self.groupsize, self.inner_k_tiles, self.padding, use_cuda)
+        return self.mod
+
+
+class WeightOnlyInt4Linear(torch.nn.Module):
+    __constants__ = ['in_features', 'out_features']
+    in_features: int
+    out_features: int
+    weight: torch.Tensor
+
+    def __init__(
+            self, in_features: int, out_features: int,
+            bias=True, device=None, dtype=None, groupsize: int = 32, inner_k_tiles: int = 8, padding: bool = True, use_cuda=True,
+    ) -> None:
+        super().__init__()
+        self.padding = padding
+        if padding:
+            from model import find_multiple
+            self.origin_in_features = in_features
+            in_features = find_multiple(in_features, 1024)
+
+        self.in_features = in_features
+        self.out_features = out_features
+        assert not bias, "require bias=False"
+        self.groupsize = groupsize
+        self.inner_k_tiles = inner_k_tiles
+
+        assert out_features % 8 == 0, "require out_features % 8 == 0"
+        assert in_features % (inner_k_tiles * 16) == 0, "require in_features % (innerKTiles * 16) == 0"
+        # if use_cuda:
+        self.register_buffer(
+            "weight",
+            torch.empty((out_features // 8, in_features // (inner_k_tiles * 16), 32, inner_k_tiles // 2), dtype=torch.int32)
+        )
+        # else:
+        #     self.register_buffer(
+        #         "weight",
+        #         torch.empty((out_features, in_features // 2), dtype=torch.uint8)
+        #     )
+        self.register_buffer(
+            "scales_and_zeros",
+            torch.empty((in_features // groupsize, out_features, 2), dtype=torch.bfloat16)
+        )
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        input = input.to(torch.bfloat16)
+        if self.padding:
+            import torch.nn.functional as F
+            input = F.pad(input, pad=(0, self.in_features - self.origin_in_features))
+        return linear_forward_int4(
+            input,
+            self.weight, self.scales_and_zeros, self.out_features, self.groupsize
+        )
+
+
 def quantize(
     checkpoint_path: Path = Path("checkpoints/mistralai/Mixtral-8x7B-v0.1/model.pth"),
     mode: str = 'int8',
+    # following arguments only available when setting int4 quantization.
+    groupsize: int = 32,
     label: str = '',
 ) -> None:
     assert checkpoint_path.is_file(), checkpoint_path
@@ -185,8 +440,18 @@ def quantize(
         base_name = checkpoint_path.name
         new_base_name = base_name.replace('.pth', f'{label}int8.pth')
 
+    elif mode == 'int4':
+        print("Quantizing model weights for int4 weight-only affine per-channel groupwise quantization")
+        print(f"Prepacking model weights in {device} optimal layout")
+        quant_handler = WeightOnlyInt4QuantHandler(model, groupsize)
+        quantized_state_dict = quant_handler.create_quantized_state_dict()
+
+        dir_name = checkpoint_path.parent
+        base_name = checkpoint_path.name
+        new_base_name = base_name.replace('.pth', f"{label}int4.g{groupsize}.{device}.pth")
+
     else:
-        raise ValueError(f"Invalid quantization mode {mode} needs to be one of [int8,]")
+        raise ValueError(f"Invalid quantization mode {mode} needs to be one of [int8, int4]")
 
     quantize_path = dir_name / new_base_name
     print(f"Writing quantized weights to {quantize_path}")
@@ -200,7 +465,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Quantize a model.')
     parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"), help='Path to the model checkpoint to be quantized.')
     parser.add_argument('--mode', '-q', type=str, default='int8', choices=['int8', 'int4', 'int4-gptq'], help='type of quantization to perform')
+    parser.add_argument('--groupsize', type=int, default=32, help='Group size for int4 quantization.')
     parser.add_argument('--label', type=str, default='_', help='label to add to output filename')
 
     args = parser.parse_args()
-    quantize(args.checkpoint_path, args.mode, args.label)
+    quantize(args.checkpoint_path, args.mode, args.groupsize, args.label)

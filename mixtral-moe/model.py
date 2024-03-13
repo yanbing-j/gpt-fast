@@ -212,7 +212,9 @@ class MOEFeedForward(nn.Module):
         x = x.view(-1, self.dim)
         # T = num_tokens, E = num_experts, D = hidden dim, A = activated experts
         # x: [T, D]
+        # print("before gate ", x.shape)
         scores = self.gate(x) # [T, E]
+        # print("after gate ", scores.shape)
         expert_weights = F.softmax(scores, dim=-1)
         expert_weights, expert_indices = torch.topk(expert_weights, self.num_activated_experts, dim=-1) # [T, A], [T, A]
         expert_weights /= expert_weights.sum(dim=-1, keepdim=True) # [T, A]
