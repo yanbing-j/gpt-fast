@@ -138,8 +138,6 @@ def _load_model(checkpoint_path, device, precision, use_tp):
     with torch.device('meta'):
         model = Transformer.from_name(checkpoint_path.parent.name)
 
-    import pdb
-    pdb.set_trace()
     if "int8" in str(checkpoint_path):
         print("Using int8 weight-only quantization!")
         from quantize import WeightOnlyBit8QuantHandler
@@ -257,12 +255,18 @@ def main(
             callback = lambda x : x
         t0 = time.perf_counter()
         import contextlib
+        from torch._inductor import config
+        config.cpp.enable_kernel_profile = True
         if (i != num_samples - 1 or not profile) or (use_tp and rank != 0):
             prof = contextlib.nullcontext()
         else:
             if device == 'cuda':
                 torch.profiler._utils._init_for_cuda_graphs()
-            prof = torch.profiler.profile()
+                prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], use_cuda=True)
+                profile_sort = 'self_cuda_time_total'
+            elif device == 'cpu':
+                prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU])
+                profile_sort = 'self_cpu_time_total'
         with prof:
             y = generate(
                 model,
@@ -276,13 +280,16 @@ def main(
         if i == -1:
             print(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
             continue
+        device_sync(device=device) # MKG
+        t = time.perf_counter() - t0
+
+        if hasattr(prof, "key_averages"):
+            print(prof.key_averages().table(sort_by=profile_sort, row_limit=-1))
         if hasattr(prof, "export_chrome_trace"):
             if use_tp:
                 prof.export_chrome_trace(f"{profile}_rank_{rank}.json")
             else:
-                prof.export_chrome_trace(f"{profile}.json")
-        device_sync(device=device) # MKG
-        t = time.perf_counter() - t0
+                prof.export_chrome_trace(f"profile_{device}.json")
 
         if not interactive:
             print(tokenizer.decode(y.tolist()))
@@ -311,7 +318,7 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
     parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
     parser.add_argument('--compile_prefill', action='store_true', help='Whether to compile the prefill (improves prefill perf, but higher compile times)')
-    parser.add_argument('--profile', type=Path, default=None, help='Profile path.')
+    parser.add_argument('--profile', action='store_true', help='Whether to profile the model')
     parser.add_argument('--device', type=str, default="cuda", help='device to use')
 
     args = parser.parse_args()
